@@ -1,0 +1,3 @@
+name = "cloudigest"
+main = "snippets.js"
+compatibility_date = "2026-05-22"
