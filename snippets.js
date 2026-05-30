@@ -3,49 +3,53 @@ export default {
     const requestUrl = new URL(request.url);
     const url = requestUrl.searchParams.get("url");
     const cursorStr = requestUrl.searchParams.get("cursor") || "0";
-    const cursor = parseInt(cursorStr, 10);
+    const cursor = Number.parseInt(cursorStr, 10);
     const stateStr = requestUrl.searchParams.get("state");
-    let state = null;
+    if (!url) return jsonError("URL is required", 400);
+    if (!Number.isSafeInteger(cursor) || cursor < 0) return jsonError("Invalid cursor", 400);
+    let resumeState = null;
     if (stateStr) {
       try {
-        state = JSON.parse(decodeURIComponent(stateStr));
-      } catch (e) {
-        return new Response(JSON.stringify({ error: "Invalid state parameter" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        resumeState = JSON.parse(stateStr);
+      } catch {
+        try {
+          resumeState = JSON.parse(decodeURIComponent(stateStr));
+        } catch {
+          return jsonError("Invalid state parameter", 400);
+        }
       }
     }
-    if (!url) {
-      return new Response(JSON.stringify({ error: "URL is required" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+    if (cursor > 0 && !resumeState) {
+      return jsonError("State is required when cursor > 0", 400);
+    }
+    let hasher;
+    try {
+      hasher = new MultiHasher(resumeState);
+      if (hasher.cursor !== cursor) {
+        return jsonError(`State/cursor mismatch: state cursor is ${hasher.cursor}, request cursor is ${cursor}`, 400);
+      }
+    } catch (e) {
+      return jsonError(e?.message || String(e), 400);
     }
     const encoder = new TextEncoder();
     const abortController = new AbortController();
+    if (request.signal) {
+      request.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+    }
     const stream = new ReadableStream({
       start(controller) {
-        const sendSSE = (data) => {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-        };
-        const sendComment = (text = "") => {
-          controller.enqueue(encoder.encode(`: ${text}\n\n`));
-        };
+        const sendRaw = (text) => controller.enqueue(encoder.encode(text));
+        const sendComment = (text = "") => sendRaw(`: ${text}\n\n`);
+        const sendSSE = (data) => sendRaw(`data: ${JSON.stringify(data)}\n\n`);
         (async () => {
           try {
-            // 先发一个注释帧，尽快把响应头和流刷出去
             sendComment("open");
             const upstream = await fetch(url, {
-              headers: {
-                Range: `bytes=${cursor}-`,
-              },
+              headers: cursor > 0 ? { Range: `bytes=${cursor}-` } : {},
               signal: abortController.signal,
             });
             if (upstream.status !== 200 && upstream.status !== 206) {
-              sendSSE({
-                error: `Fetch failed: HTTP ${upstream.status} ${upstream.statusText}`,
-              });
+              sendSSE({ error: `Fetch failed: HTTP ${upstream.status} ${upstream.statusText}` });
               return;
             }
             if (!upstream.body) {
@@ -53,110 +57,40 @@ export default {
               return;
             }
             const reader = upstream.body.getReader();
-            let currentCursor = cursor;
-            let stateObj = state || {};
-            let sha1State = stateObj.sha1 || {
-              h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
-              len: 0,
-            };
-            let sha256State = stateObj.sha256 || {
-              h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
-              len: 0,
-            };
-            let md5State = stateObj.md5 || {
-              h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
-              len: 0,
-            };
-            const CHUNK_SIZE = 1024 * 1024;
-            let lastSentCursor = cursor;
-            let pendingBuffer;
             if (upstream.status === 200 && cursor > 0) {
-              let discarded = 0;
-              let tempBuffer = null;
-              while (discarded < cursor) {
-                const { done, value } = await reader.read();
-                if (done) {
-                  sendSSE({
-                    error: `Non-range source URL too short, expected ${cursor} but EOF at ${discarded}`,
-                  });
-                  return;
-                }
-                if (discarded + value.length <= cursor) {
-                  discarded += value.length;
-                } else {
-                  const needed = cursor - discarded;
-                  tempBuffer = value.subarray(needed);
-                  discarded = cursor;
-                }
-              }
-              pendingBuffer = new Uint8Array(tempBuffer || []);
-            } else {
-              pendingBuffer = new Uint8Array(stateObj.buffer || []);
+              const leftover = await discardBytes(reader, cursor);
+              if (leftover) hasher.update(leftover);
             }
+            const PROGRESS_INTERVAL = 1024 * 1024;
+            let lastSentCursor = cursor;
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              const combined = new Uint8Array(pendingBuffer.length + value.length);
-              combined.set(pendingBuffer);
-              combined.set(value, pendingBuffer.length);
-              let offset = 0;
-              while (offset + 64 <= combined.length) {
-                const block = combined.subarray(offset, offset + 64);
-                processBlock(block, sha1State);
-                processBlockSHA256(block, sha256State);
-                processBlockMD5(block, md5State);
-                offset += 64;
-                currentCursor += 64;
-                sha1State.len += 64;
-                sha256State.len += 64;
-                md5State.len += 64;
-                if (currentCursor - lastSentCursor >= CHUNK_SIZE) {
-                  // 注意：断点续算最好把尾块也带上
-                  const tail = Array.from(combined.subarray(offset));
+              if (value && value.byteLength) {
+                hasher.update(value);
+                if (hasher.cursor - lastSentCursor >= PROGRESS_INTERVAL) {
                   sendSSE({
                     status: "processing",
-                    cursor: currentCursor,
-                    state: {
-                      sha1: {
-                        h: Array.from(sha1State.h),
-                        len: sha1State.len,
-                      },
-                      sha256: {
-                        h: Array.from(sha256State.h),
-                        len: sha256State.len,
-                      },
-                      md5: {
-                        h: Array.from(md5State.h),
-                        len: md5State.len,
-                      },
-                      buffer: tail,
-                    },
+                    cursor: hasher.cursor,
+                    state: hasher.exportState(),
                   });
-                  lastSentCursor = currentCursor;
+                  lastSentCursor = hasher.cursor;
                 }
               }
-              pendingBuffer = combined.subarray(offset);
             }
-            const finalSHA1 = finalizeSHA1(pendingBuffer, sha1State);
-            const finalSHA256 = finalizeSHA256(pendingBuffer, sha256State);
-            const finalMD5 = finalizeMD5(pendingBuffer, md5State);
             sendSSE({
               status: "completed",
-              cursor: currentCursor + pendingBuffer.length,
-              hashes: {
-                sha1: finalSHA1,
-                sha256: finalSHA256,
-                md5: finalMD5,
-              },
+              cursor: hasher.cursor,
+              hashes: hasher.digest(),
             });
           } catch (e) {
             try {
               sendSSE({ error: e?.message || String(e) });
-            } catch (_) {}
+            } catch {}
           } finally {
             try {
               controller.close();
-            } catch (_) {}
+            } catch {}
           }
         })();
       },
@@ -174,11 +108,140 @@ export default {
     });
   },
 };
-// SHA-1 核心逻辑实现
-function processBlock(block, state) {
+function jsonError(error, status = 400) {
+  return new Response(JSON.stringify({ error }), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  });
+}
+async function discardBytes(reader, bytes) {
+  let discarded = 0;
+  while (discarded < bytes) {
+    const { done, value } = await reader.read();
+    if (done) {
+      throw new Error(`Non-range source URL too short, expected ${bytes} but EOF at ${discarded}`);
+    }
+    const next = discarded + value.byteLength;
+    if (next <= bytes) {
+      discarded = next;
+      continue;
+    }
+    const offset = bytes - discarded;
+    return value.subarray(offset);
+  }
+  return null;
+}
+class MultiHasher {
+  constructor(saved = null) {
+    const buffer = saved?.buffer ? Uint8Array.from(saved.buffer) : new Uint8Array(0);
+    if (buffer.byteLength >= 64) throw new Error("Invalid state: buffer must be shorter than 64 bytes");
+    this.buffer = new Uint8Array(64);
+    this.bufferLen = buffer.byteLength;
+    this.buffer.set(buffer);
+    this.sha1 = normalizeHashState(saved?.sha1, [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0], 5);
+    this.sha256 = normalizeHashState(saved?.sha256, [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], 8);
+    this.md5 = normalizeHashState(saved?.md5, [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], 4);
+    if (this.sha1.len !== this.sha256.len || this.sha1.len !== this.md5.len) {
+      throw new Error("Invalid state: hash lengths mismatch");
+    }
+    if (this.sha1.len % 64 !== 0) {
+      throw new Error("Invalid state: processed length must be a multiple of 64");
+    }
+  }
+  get cursor() {
+    return this.sha1.len + this.bufferLen;
+  }
+  update(chunk) {
+    if (!chunk || chunk.byteLength === 0) return;
+    let offset = 0;
+    const length = chunk.byteLength;
+    if (this.bufferLen > 0) {
+      const need = 64 - this.bufferLen;
+      const take = Math.min(need, length);
+      this.buffer.set(chunk.subarray(0, take), this.bufferLen);
+      this.bufferLen += take;
+      offset += take;
+      if (this.bufferLen === 64) {
+        this.process64(this.buffer);
+        this.bufferLen = 0;
+      }
+    }
+    const fullEnd = offset + Math.floor((length - offset) / 64) * 64;
+    while (offset < fullEnd) {
+      this.process64(chunk.subarray(offset, offset + 64));
+      offset += 64;
+    }
+    if (offset < length) {
+      this.bufferLen = length - offset;
+      this.buffer.set(chunk.subarray(offset), 0);
+    }
+  }
+  process64(block) {
+    processBlockSHA1(block, this.sha1);
+    processBlockSHA256(block, this.sha256);
+    processBlockMD5(block, this.md5);
+    this.sha1.len += 64;
+    this.sha256.len += 64;
+    this.md5.len += 64;
+  }
+  exportState() {
+    const tail = Array.from(this.buffer.subarray(0, this.bufferLen));
+    return {
+      sha1: { h: Array.from(this.sha1.h), len: this.sha1.len },
+      sha256: { h: Array.from(this.sha256.h), len: this.sha256.len },
+      md5: { h: Array.from(this.md5.h), len: this.md5.len },
+      buffer: tail,
+    };
+  }
+  digest() {
+    const tail = this.buffer.subarray(0, this.bufferLen);
+    return {
+      sha1: finalizeSHA1(tail, cloneState(this.sha1)),
+      sha256: finalizeSHA256(tail, cloneState(this.sha256)),
+      md5: finalizeMD5(tail, cloneState(this.md5)),
+    };
+  }
+}
+function normalizeHashState(saved, initialH, hLen) {
+  if (!saved) return { h: initialH.slice(), len: 0 };
+  if (!Array.isArray(saved.h) || saved.h.length !== hLen) {
+    throw new Error("Invalid state: bad hash state");
+  }
+  if (!Number.isSafeInteger(saved.len) || saved.len < 0) {
+    throw new Error("Invalid state: bad hash length");
+  }
+  return {
+    h: saved.h.map((x) => x | 0),
+    len: saved.len,
+  };
+}
+function cloneState(state) {
+  return {
+    h: state.h.slice(),
+    len: state.len,
+  };
+}
+function rotl(n, b) {
+  return (n << b) | (n >>> (32 - b));
+}
+function rotr(n, b) {
+  return (n >>> b) | (n << (32 - b));
+}
+function writeLen64BE(view, offset, byteLen) {
+  const bits = BigInt(byteLen) * 8n;
+  view.setUint32(offset, Number((bits >> 32n) & 0xffffffffn), false);
+  view.setUint32(offset + 4, Number(bits & 0xffffffffn), false);
+}
+function writeLen64LE(view, offset, byteLen) {
+  const bits = BigInt(byteLen) * 8n;
+  view.setUint32(offset, Number(bits & 0xffffffffn), true);
+  view.setUint32(offset + 4, Number((bits >> 32n) & 0xffffffffn), true);
+}
+// SHA-1
+function processBlockSHA1(block, state) {
   const w = new Uint32Array(80);
   for (let i = 0; i < 16; i++) {
-    w[i] = (block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    w[i] = ((block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3]) >>> 0;
   }
   for (let i = 16; i < 80; i++) {
     w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
@@ -212,52 +275,41 @@ function processBlock(block, state) {
   state.h[3] = (state.h[3] + d) | 0;
   state.h[4] = (state.h[4] + e) | 0;
 }
-function rotl(n, b) {
-  return (n << b) | (n >>> (32 - b));
-}
 function finalizeSHA1(tail, state) {
-  const totalBits = (state.len + tail.length) * 8;
-  const paddingNeeded = 64 - ((tail.length + 9) % 64);
-  const padded = new Uint8Array(tail.length + 1 + (paddingNeeded === 64 ? 0 : paddingNeeded) + 8);
+  const totalLen = state.len + tail.byteLength;
+  const zeroLen = (56 - ((tail.byteLength + 1) % 64) + 64) % 64;
+  const padded = new Uint8Array(tail.byteLength + 1 + zeroLen + 8);
   padded.set(tail);
-  padded[tail.length] = 0x80;
-  // 注入长度信息 (64-bit big endian)
-  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
-  view.setUint32(padded.length - 4, totalBits & 0xffffffff);
-  view.setUint32(padded.length - 8, (totalBits / 0x100000000) >>> 0);
-  for (let i = 0; i < padded.length; i += 64) {
-    processBlock(padded.subarray(i, i + 64), state);
+  padded[tail.byteLength] = 0x80;
+  writeLen64BE(new DataView(padded.buffer), padded.byteLength - 8, totalLen);
+  for (let i = 0; i < padded.byteLength; i += 64) {
+    processBlockSHA1(padded.subarray(i, i + 64), state);
   }
-  return Array.from(state.h)
-    .map((x) => (x >>> 0).toString(16).padStart(8, "0"))
-    .join("");
+  return state.h.map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
 }
-// SHA-256 核心逻辑实现
+// SHA-256
 const K256 = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
   0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
   0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ]);
-function rotR(x, n) {
-  return (x >>> n) | (x << (32 - n));
-}
 function processBlockSHA256(block, state) {
   const w = new Uint32Array(64);
   for (let i = 0; i < 16; i++) {
-    w[i] = (block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    w[i] = ((block[i * 4] << 24) | (block[i * 4 + 1] << 16) | (block[i * 4 + 2] << 8) | block[i * 4 + 3]) >>> 0;
   }
   for (let i = 16; i < 64; i++) {
-    const s0 = rotR(w[i - 15], 7) ^ rotR(w[i - 15], 18) ^ (w[i - 15] >>> 3);
-    const s1 = rotR(w[i - 2], 17) ^ rotR(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+    const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+    const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
     w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
   }
   let [a, b, c, d, e, f, g, h] = state.h;
   for (let i = 0; i < 64; i++) {
-    const S1 = rotR(e, 6) ^ rotR(e, 11) ^ rotR(e, 25);
+    const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
     const ch = (e & f) ^ (~e & g);
     const temp1 = (h + S1 + ch + K256[i] + w[i]) | 0;
-    const S0 = rotR(a, 2) ^ rotR(a, 13) ^ rotR(a, 22);
+    const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
     const maj = (a & b) ^ (a & c) ^ (b & c);
     const temp2 = (S0 + maj) | 0;
     h = g;
@@ -279,22 +331,18 @@ function processBlockSHA256(block, state) {
   state.h[7] = (state.h[7] + h) | 0;
 }
 function finalizeSHA256(tail, state) {
-  const totalBits = (state.len + tail.length) * 8;
-  const paddingNeeded = 64 - ((tail.length + 9) % 64);
-  const padded = new Uint8Array(tail.length + 1 + (paddingNeeded === 64 ? 0 : paddingNeeded) + 8);
+  const totalLen = state.len + tail.byteLength;
+  const zeroLen = (56 - ((tail.byteLength + 1) % 64) + 64) % 64;
+  const padded = new Uint8Array(tail.byteLength + 1 + zeroLen + 8);
   padded.set(tail);
-  padded[tail.length] = 0x80;
-  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
-  view.setUint32(padded.length - 4, totalBits & 0xffffffff);
-  view.setUint32(padded.length - 8, (totalBits / 0x100000000) >>> 0);
-  for (let i = 0; i < padded.length; i += 64) {
+  padded[tail.byteLength] = 0x80;
+  writeLen64BE(new DataView(padded.buffer), padded.byteLength - 8, totalLen);
+  for (let i = 0; i < padded.byteLength; i += 64) {
     processBlockSHA256(padded.subarray(i, i + 64), state);
   }
-  return Array.from(state.h)
-    .map((x) => (x >>> 0).toString(16).padStart(8, "0"))
-    .join("");
+  return state.h.map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
 }
-// MD5 核心逻辑实现
+// MD5
 function F(x, y, z) {
   return (x & y) | (~x & z);
 }
@@ -313,7 +361,6 @@ function processBlockMD5(block, state) {
     x[i] = block[i * 4] | (block[i * 4 + 1] << 8) | (block[i * 4 + 2] << 16) | (block[i * 4 + 3] << 24);
   }
   let [a, b, c, d] = state.h;
-  // Round 1
   a = (b + rotl(a + F(b, c, d) + x[0] + 0xd76aa478, 7)) | 0;
   d = (a + rotl(d + F(a, b, c) + x[1] + 0xe8c7b756, 12)) | 0;
   c = (d + rotl(c + F(d, a, b) + x[2] + 0x242070db, 17)) | 0;
@@ -330,7 +377,6 @@ function processBlockMD5(block, state) {
   d = (a + rotl(d + F(a, b, c) + x[13] + 0xfd987193, 12)) | 0;
   c = (d + rotl(c + F(d, a, b) + x[14] + 0xa679438e, 17)) | 0;
   b = (c + rotl(b + F(c, d, a) + x[15] + 0x49b40821, 22)) | 0;
-  // Round 2
   a = (b + rotl(a + G(b, c, d) + x[1] + 0xf61e2562, 5)) | 0;
   d = (a + rotl(d + G(a, b, c) + x[6] + 0xc040b340, 9)) | 0;
   c = (d + rotl(c + G(d, a, b) + x[11] + 0x265e5a51, 14)) | 0;
@@ -347,7 +393,6 @@ function processBlockMD5(block, state) {
   d = (a + rotl(d + G(a, b, c) + x[2] + 0xfcefa3f8, 9)) | 0;
   c = (d + rotl(c + G(d, a, b) + x[7] + 0x676f02d9, 14)) | 0;
   b = (c + rotl(b + G(c, d, a) + x[12] + 0x8d2a4c8a, 20)) | 0;
-  // Round 3
   a = (b + rotl(a + H(b, c, d) + x[5] + 0xfffa3942, 4)) | 0;
   d = (a + rotl(d + H(a, b, c) + x[8] + 0x8771f681, 11)) | 0;
   c = (d + rotl(c + H(d, a, b) + x[11] + 0x6d9d6122, 16)) | 0;
@@ -364,7 +409,6 @@ function processBlockMD5(block, state) {
   d = (a + rotl(d + H(a, b, c) + x[12] + 0xe6db99e5, 11)) | 0;
   c = (d + rotl(c + H(d, a, b) + x[15] + 0x1fa27cf8, 16)) | 0;
   b = (c + rotl(b + H(c, d, a) + x[2] + 0xc4ac5665, 23)) | 0;
-  // Round 4
   a = (b + rotl(a + I(b, c, d) + x[0] + 0xf4292244, 6)) | 0;
   d = (a + rotl(d + I(a, b, c) + x[7] + 0x432aff97, 10)) | 0;
   c = (d + rotl(c + I(d, a, b) + x[14] + 0xab9423a7, 15)) | 0;
@@ -387,24 +431,23 @@ function processBlockMD5(block, state) {
   state.h[3] = (state.h[3] + d) | 0;
 }
 function finalizeMD5(tail, state) {
-  const totalBits = (state.len + tail.length) * 8;
-  const paddingNeeded = 64 - ((tail.length + 9) % 64);
-  const padded = new Uint8Array(tail.length + 1 + (paddingNeeded === 64 ? 0 : paddingNeeded) + 8);
+  const totalLen = state.len + tail.byteLength;
+  const zeroLen = (56 - ((tail.byteLength + 1) % 64) + 64) % 64;
+  const padded = new Uint8Array(tail.byteLength + 1 + zeroLen + 8);
   padded.set(tail);
-  padded[tail.length] = 0x80;
-  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
-  view.setUint32(padded.length - 8, totalBits & 0xffffffff, true);
-  view.setUint32(padded.length - 4, (totalBits / 0x100000000) >>> 0, true);
-  for (let i = 0; i < padded.length; i += 64) {
+  padded[tail.byteLength] = 0x80;
+  writeLen64LE(new DataView(padded.buffer), padded.byteLength - 8, totalLen);
+  for (let i = 0; i < padded.byteLength; i += 64) {
     processBlockMD5(padded.subarray(i, i + 64), state);
   }
-  return Array.from(state.h)
+  return state.h
     .map((x) => {
-      const b0 = (x & 0xff).toString(16).padStart(2, "0");
-      const b1 = ((x >> 8) & 0xff).toString(16).padStart(2, "0");
-      const b2 = ((x >> 16) & 0xff).toString(16).padStart(2, "0");
-      const b3 = ((x >> 24) & 0xff).toString(16).padStart(2, "0");
-      return b0 + b1 + b2 + b3;
+      return (
+        (x & 0xff).toString(16).padStart(2, "0") +
+        ((x >>> 8) & 0xff).toString(16).padStart(2, "0") +
+        ((x >>> 16) & 0xff).toString(16).padStart(2, "0") +
+        ((x >>> 24) & 0xff).toString(16).padStart(2, "0")
+      );
     })
     .join("");
 }
