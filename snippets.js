@@ -19,8 +19,9 @@ export default {
             Range: `bytes=${cursor}-`,
           },
         });
-        if (!response.ok && response.status !== 206) {
-          server.send(JSON.stringify({ error: `Fetch failed: ${response.statusText}` }));
+        if (response.status !== 200 && response.status !== 206) {
+          server.send(JSON.stringify({ error: `Fetch failed: HTTP ${response.status} ${response.statusText}` }));
+          server.close();
           return;
         }
         const reader = response.body.getReader();
@@ -31,7 +32,33 @@ export default {
           buffer: [], // 用于处理不完整块
         };
         const CHUNK_SIZE = 1024 * 1024; // 1MB 推送一次
-        let pendingBuffer = new Uint8Array(sha1State.buffer || []);
+        let lastSentCursor = cursor;
+        let pendingBuffer;
+
+        // 如果服务器不支持 Range 请求 (返回 200 而非 206)，我们需要丢弃前 cursor 字节
+        if (response.status === 200 && cursor > 0) {
+          let discarded = 0;
+          let tempBuffer = null;
+          while (discarded < cursor) {
+            const { done, value } = await reader.read();
+            if (done) {
+              server.send(JSON.stringify({ error: `Non-range source URL too short, expected ${cursor} but EOF at ${discarded}` }));
+              server.close();
+              return;
+            }
+            if (discarded + value.length <= cursor) {
+              discarded += value.length;
+            } else {
+              const needed = cursor - discarded;
+              tempBuffer = value.subarray(needed);
+              discarded = cursor;
+            }
+          }
+          pendingBuffer = new Uint8Array(tempBuffer || []);
+        } else {
+          pendingBuffer = new Uint8Array(sha1State.buffer || []);
+        }
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -47,7 +74,7 @@ export default {
             currentCursor += 64;
             sha1State.len += 64;
             // 每达到 1MB 发送一次快照
-            if (currentCursor % CHUNK_SIZE === 0) {
+            if (currentCursor - lastSentCursor >= CHUNK_SIZE) {
               server.send(
                 JSON.stringify({
                   status: "processing",
@@ -59,6 +86,7 @@ export default {
                   },
                 }),
               );
+              lastSentCursor = currentCursor;
             }
           }
           pendingBuffer = combined.subarray(offset);
@@ -129,7 +157,7 @@ function finalizeSHA1(tail, state) {
   padded.set(tail);
   padded[tail.length] = 0x80;
   // 注入长度信息 (64-bit big endian)
-  const view = new DataView(padded.buffer);
+  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
   view.setUint32(padded.length - 4, totalBits & 0xffffffff);
   view.setUint32(padded.length - 8, (totalBits / 0x100000000) >>> 0);
   for (let i = 0; i < padded.length; i += 64) {
