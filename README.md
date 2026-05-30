@@ -1,3 +1,8 @@
+<div align="right">
+<a title="简体中文" href="README.md"><img src="https://img.shields.io/badge/-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-A31F34?style=for-the-badge" alt="简体中文"></a>
+<a title="English" href="README_en.md"><img src="https://img.shields.io/badge/-English-545759?style=for-the-badge" alt="English"></a>
+</div>
+
 # Cloudigest 流式哈希计算服务
 
 这是一个基于 Cloudflare Workers/Snippets 的轻量哈希计算服务，通过 HTTP GET 请求驱动，利用 Server-Sent Events (SSE) 推送中间状态和最终结果，可对远程 URL 指向的任意资源进行流式、高效的多哈希计算。  
