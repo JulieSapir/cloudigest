@@ -3,7 +3,9 @@ export default {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
     }
-    const [client, server] = new WebSocketPair();
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
     server.accept();
     server.addEventListener("message", async (msg) => {
       try {
