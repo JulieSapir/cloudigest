@@ -1,95 +1,118 @@
 export default {
   async fetch(request, env, ctx) {
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected Upgrade: websocket", { status: 426 });
-    }
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-    server.accept();
-    server.addEventListener("message", async (msg) => {
+    const requestUrl = new URL(request.url);
+    const url = requestUrl.searchParams.get("url");
+    const cursorStr = requestUrl.searchParams.get("cursor") || "0";
+    const cursor = parseInt(cursorStr, 10);
+    const stateStr = requestUrl.searchParams.get("state");
+    let state = null;
+    if (stateStr) {
       try {
-        const data = JSON.parse(msg.data);
-        const { url, cursor = 0, state = null } = data;
-        if (!url) {
-          server.send(JSON.stringify({ error: "URL is required" }));
-          return;
-        }
-        // 发起单次请求，获取资源流
-        const response = await fetch(url, {
-          headers: {
-            Range: `bytes=${cursor}-`,
-          },
+        state = JSON.parse(decodeURIComponent(stateStr));
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid state parameter" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
         });
-        if (response.status !== 200 && response.status !== 206) {
-          server.send(JSON.stringify({ error: `Fetch failed: HTTP ${response.status} ${response.statusText}` }));
-          server.close();
-          return;
-        }
-        const reader = response.body.getReader();
-        let currentCursor = cursor;
-        let stateObj = state || {};
-        let sha1State = stateObj.sha1 || {
-          h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
-          len: 0,
-        };
-        let sha256State = stateObj.sha256 || {
-          h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
-          len: 0,
-        };
-        let md5State = stateObj.md5 || {
-          h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
-          len: 0,
-        };
-        const CHUNK_SIZE = 1024 * 1024; // 1MB 推送一次
-        let lastSentCursor = cursor;
-        let pendingBuffer;
-        // 如果服务器不支持 Range 请求 (返回 200 而非 206)，我们需要丢弃前 cursor 字节
-        if (response.status === 200 && cursor > 0) {
-          let discarded = 0;
-          let tempBuffer = null;
-          while (discarded < cursor) {
-            const { done, value } = await reader.read();
-            if (done) {
-              server.send(JSON.stringify({ error: `Non-range source URL too short, expected ${cursor} but EOF at ${discarded}` }));
-              server.close();
-              return;
-            }
-            if (discarded + value.length <= cursor) {
-              discarded += value.length;
-            } else {
-              const needed = cursor - discarded;
-              tempBuffer = value.subarray(needed);
-              discarded = cursor;
-            }
+      }
+    }
+
+    if (!url) {
+      return new Response(JSON.stringify({ error: "URL is required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const { writable, readable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    const sendSSE = (data) => {
+      try {
+        writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+      } catch (e) {
+        // 忽略写入失败（例如客户端断开连接）
+      }
+    };
+
+    ctx.waitUntil(
+      (async () => {
+        try {
+          // 发起单次请求，获取资源流
+          const response = await fetch(url, {
+            headers: {
+              Range: `bytes=${cursor}-`,
+            },
+          });
+          if (response.status !== 200 && response.status !== 206) {
+            sendSSE({ error: `Fetch failed: HTTP ${response.status} ${response.statusText}` });
+            await writer.close();
+            return;
           }
-          pendingBuffer = new Uint8Array(tempBuffer || []);
-        } else {
-          pendingBuffer = new Uint8Array(sha1State.buffer || []);
-        }
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          // 合并新数据
-          let combined = new Uint8Array(pendingBuffer.length + value.length);
-          combined.set(pendingBuffer);
-          combined.set(value, pendingBuffer.length);
-          let offset = 0;
-          while (offset + 64 <= combined.length) {
-            // 处理 64 字节的块 - 极其极致地联合分发数据流，减少内存碎片与垃圾回收
-            const block = combined.subarray(offset, offset + 64);
-            processBlock(block, sha1State);
-            processBlockSHA256(block, sha256State);
-            processBlockMD5(block, md5State);
-            offset += 64;
-            currentCursor += 64;
-            sha1State.len += 64;
-            sha256State.len += 64;
-            md5State.len += 64;
-            // 每达到 1MB 发送一次快照
-            if (currentCursor - lastSentCursor >= CHUNK_SIZE) {
-              server.send(
-                JSON.stringify({
+          const reader = response.body.getReader();
+          let currentCursor = cursor;
+          let stateObj = state || {};
+          let sha1State = stateObj.sha1 || {
+            h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
+            len: 0,
+          };
+          let sha256State = stateObj.sha256 || {
+            h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19],
+            len: 0,
+          };
+          let md5State = stateObj.md5 || {
+            h: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
+            len: 0,
+          };
+          const CHUNK_SIZE = 1024 * 1024; // 1MB 推送一次
+          let lastSentCursor = cursor;
+          let pendingBuffer;
+          // 如果服务器不支持 Range 请求 (返回 200 而非 206)，我们需要丢弃前 cursor 字节
+          if (response.status === 200 && cursor > 0) {
+            let discarded = 0;
+            let tempBuffer = null;
+            while (discarded < cursor) {
+              const { done, value } = await reader.read();
+              if (done) {
+                sendSSE({ error: `Non-range source URL too short, expected ${cursor} but EOF at ${discarded}` });
+                await writer.close();
+                return;
+              }
+              if (discarded + value.length <= cursor) {
+                discarded += value.length;
+              } else {
+                const needed = cursor - discarded;
+                tempBuffer = value.subarray(needed);
+                discarded = cursor;
+              }
+            }
+            pendingBuffer = new Uint8Array(tempBuffer || []);
+          } else {
+            pendingBuffer = new Uint8Array(sha1State.buffer || []);
+          }
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            // 合并新数据
+            let combined = new Uint8Array(pendingBuffer.length + value.length);
+            combined.set(pendingBuffer);
+            combined.set(value, pendingBuffer.length);
+            let offset = 0;
+            while (offset + 64 <= combined.length) {
+              // 处理 64 字节的块 - 极其极致地联合分发数据流，减少内存碎片与垃圾回收
+              const block = combined.subarray(offset, offset + 64);
+              processBlock(block, sha1State);
+              processBlockSHA256(block, sha256State);
+              processBlockMD5(block, md5State);
+              offset += 64;
+              currentCursor += 64;
+              sha1State.len += 64;
+              sha256State.len += 64;
+              md5State.len += 64;
+              // 每达到 1MB 发送一次快照
+              if (currentCursor - lastSentCursor >= CHUNK_SIZE) {
+                sendSSE({
                   status: "processing",
                   cursor: currentCursor,
                   state: {
@@ -106,19 +129,17 @@ export default {
                       len: md5State.len,
                     },
                   },
-                }),
-              );
-              lastSentCursor = currentCursor;
+                });
+                lastSentCursor = currentCursor;
+              }
             }
+            pendingBuffer = combined.subarray(offset);
           }
-          pendingBuffer = combined.subarray(offset);
-        }
-        // 完成计算：处理最后的 padding
-        const finalSHA1 = finalizeSHA1(pendingBuffer, sha1State);
-        const finalSHA256 = finalizeSHA256(pendingBuffer, sha256State);
-        const finalMD5 = finalizeMD5(pendingBuffer, md5State);
-        server.send(
-          JSON.stringify({
+          // 完成计算：处理最后的 padding
+          const finalSHA1 = finalizeSHA1(pendingBuffer, sha1State);
+          const finalSHA256 = finalizeSHA256(pendingBuffer, sha256State);
+          const finalMD5 = finalizeMD5(pendingBuffer, md5State);
+          sendSSE({
             status: "completed",
             cursor: currentCursor + pendingBuffer.length,
             hashes: {
@@ -126,15 +147,25 @@ export default {
               sha256: finalSHA256,
               md5: finalMD5,
             },
-          }),
-        );
-        server.close();
-      } catch (e) {
-        server.send(JSON.stringify({ error: e.message }));
-        server.close();
-      }
+          });
+          await writer.close();
+        } catch (e) {
+          sendSSE({ error: e.message });
+          try {
+            await writer.close();
+          } catch (_) {}
+        }
+      })(),
+    );
+
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+      },
     });
-    return new Response(null, { status: 101, webSocket: client });
   },
 };
 // SHA-1 核心逻辑实现
