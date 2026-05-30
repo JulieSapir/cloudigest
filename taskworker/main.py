@@ -20,13 +20,13 @@ class CloudigestTaskWorker:
         self.target_url = target_url
         self.cursor = 0
         self.state = None
-        self.final_hash = None
+        self.final_hashes = None
 
     async def run(self):
         retries = 0
         max_retries = 10
 
-        while self.final_hash is None:
+        while self.final_hashes is None:
             try:
                 logger.info(
                     f"Connecting to Cloudigest websocket at {self.ws_url} (cursor={self.cursor})..."
@@ -53,14 +53,19 @@ class CloudigestTaskWorker:
                         if status == "processing":
                             self.cursor = data.get("cursor", self.cursor)
                             self.state = data.get("state", self.state)
+                            sha1_len = (
+                                self.state.get("sha1", {}).get("len", "N/A")
+                                if self.state
+                                else "N/A"
+                            )
                             logger.info(
-                                f"Progress update: cursor={self.cursor}, len={self.state.get('len') if self.state else 'N/A'}"
+                                f"Progress update: cursor={self.cursor}, len={sha1_len}"
                             )
                         elif status == "completed":
                             self.cursor = data.get("cursor", self.cursor)
-                            self.final_hash = data.get("hash")
+                            self.final_hashes = data.get("hashes")
                             logger.info(
-                                f"Task completed successfully! Cursor={self.cursor}, SHA-1 Hash={self.final_hash}"
+                                f"Task completed successfully! Cursor={self.cursor}, Hashes={self.final_hashes}"
                             )
                             break
                         else:
@@ -84,7 +89,7 @@ class CloudigestTaskWorker:
                     raise e
                 await asyncio.sleep(1)  # 避让重连
 
-        return self.final_hash
+        return self.final_hashes
 
 
 def main():
@@ -102,8 +107,8 @@ def main():
         sys.exit(1)
 
     try:
-        final_hash = asyncio.run(CloudigestTaskWorker(ws_url, target_url).run())
-        print(f"RESULT_HASH:{final_hash}")
+        final_hashes = asyncio.run(CloudigestTaskWorker(ws_url, target_url).run())
+        print(f"RESULT_HASH:{json.dumps(final_hashes)}")
     except Exception as e:
         logger.error(f"Task submission failed: {e}")
         sys.exit(2)
