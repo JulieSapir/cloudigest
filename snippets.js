@@ -1,10 +1,10 @@
 export default {
-  async fetch(request, env, ctx) {
-    const requestUrl = new URL(request.url);
-    const url = requestUrl.searchParams.get("url");
-    const cursorStr = requestUrl.searchParams.get("cursor") || "0";
+  async fetch(request) {
+    const searchParams = new URL(request.url).searchParams;
+    const url = searchParams.get("url");
+    const cursorStr = searchParams.get("cursor") || "0";
     const cursor = Number.parseInt(cursorStr, 10);
-    const stateStr = requestUrl.searchParams.get("state");
+    const stateStr = searchParams.get("state");
     if (!url) return jsonError("URL is required", 400);
     if (!Number.isSafeInteger(cursor) || cursor < 0) return jsonError("Invalid cursor", 400);
     let resumeState = null;
@@ -15,19 +15,19 @@ export default {
         try {
           resumeState = JSON.parse(decodeURIComponent(stateStr));
         } catch {
-          return jsonError("Invalid state parameter", 400);
+          return jsonError(InvalidState, 400);
         }
       }
     }
     if (cursor > 0 && !resumeState) {
-      return jsonError("State is required when cursor > 0", 400);
+      return jsonError(InvalidState, 400);
     }
     const isIntermediate = cursor > 0;
     let hasher;
     try {
       hasher = new MultiHasher(resumeState);
       if (hasher.cursor !== cursor) {
-        return jsonError(`State/cursor mismatch: state cursor is ${hasher.cursor}, request cursor is ${cursor}`, 400);
+        return jsonError(`State/cursor mismatch: ${hasher.cursor}-${cursor}`, 400);
       }
     } catch (e) {
       return jsonError(e?.message || String(e), 400);
@@ -51,15 +51,15 @@ export default {
               signal: abortController.signal,
             });
             if (upstream.status !== 200 && upstream.status !== 206) {
-              sendSSE({ error: `Fetch failed: HTTP ${upstream.status} ${upstream.statusText}` });
+              sendSSE({ error: `Failed: HTTP ${upstream.status}` });
               return;
             }
             if (!upstream.body) {
-              sendSSE({ error: "Upstream response has no body" });
+              sendSSE({ error: "Empty body" });
               return;
             }
             const reader = upstream.body.getReader();
-            const SIZE_LIMIT = 1024 * 1024 * 1024;
+            const SIZE_LIMIT = 1 << 30;
             const contentLength = parseContentLength(upstream.headers.get("content-length"));
             const useNative = !isIntermediate && upstream.status === 200 && contentLength !== null && contentLength <= SIZE_LIMIT;
             if (useNative) {
@@ -70,7 +70,7 @@ export default {
               const sha1w = sha1.getWriter();
               const sha256w = sha256.getWriter();
               writers = [md5w, sha1w, sha256w];
-              const HEARTBEAT_INTERVAL = 10 * 1024 * 1024;
+              const HEARTBEAT_INTERVAL = 5 << 21;
               let processed = 0;
               let lastBeat = 0;
               while (true) {
@@ -157,6 +157,10 @@ export default {
     });
   },
 };
+const InvalidState = "Invalid state";
+function throwError(message) {
+  throw new Error(message);
+}
 function jsonError(error, status = 400) {
   return new Response(JSON.stringify({ error }), {
     status,
@@ -182,7 +186,7 @@ async function discardBytes(reader, bytes) {
   while (discarded < bytes) {
     const { done, value } = await reader.read();
     if (done) {
-      throw new Error(`Non-range source URL too short, expected ${bytes} but EOF at ${discarded}`);
+      throwError(`Expected ${bytes} but EOF at ${discarded}`);
     }
     const next = discarded + value.byteLength;
     if (next <= bytes) {
@@ -197,8 +201,8 @@ async function discardBytes(reader, bytes) {
 class MultiHasher {
   constructor(saved = null) {
     const savedBuffer = saved?.buffer;
-    const savedLen = savedBuffer ? savedBuffer.length : 0;
-    if (savedLen >= 64) throw new Error("Invalid state: buffer must be shorter than 64 bytes");
+    const savedLen = savedBuffer?.length || 0;
+    if (savedLen >= 64) throwError(InvalidState);
     this.buffer = new Uint8Array(64);
     this.bufferLen = savedLen;
     if (savedLen > 0) this.buffer.set(savedBuffer);
@@ -206,10 +210,10 @@ class MultiHasher {
     this.sha256 = normalizeHashState(saved?.sha256, [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], 8);
     this.md5 = normalizeHashState(saved?.md5, [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], 4);
     if (this.sha1.len !== this.sha256.len || this.sha1.len !== this.md5.len) {
-      throw new Error("Invalid state: hash lengths mismatch");
+      throwError(InvalidState);
     }
     if (this.sha1.len % 64 !== 0) {
-      throw new Error("Invalid state: processed length must be a multiple of 64");
+      throwError(InvalidState);
     }
   }
   get cursor() {
@@ -269,10 +273,10 @@ class MultiHasher {
 function normalizeHashState(saved, initialH, hLen) {
   if (!saved) return { h: initialH.slice(), len: 0 };
   if (!Array.isArray(saved.h) || saved.h.length !== hLen) {
-    throw new Error("Invalid state: bad hash state");
+    throwError(InvalidState);
   }
   if (!Number.isSafeInteger(saved.len) || saved.len < 0) {
-    throw new Error("Invalid state: bad hash length");
+    throwError(InvalidState);
   }
   return {
     h: saved.h.map((x) => x | 0),
