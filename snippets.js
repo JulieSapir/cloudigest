@@ -22,6 +22,7 @@ export default {
     if (cursor > 0 && !resumeState) {
       return jsonError("State is required when cursor > 0", 400);
     }
+    const isIntermediate = cursor > 0;
     let hasher;
     try {
       hasher = new MultiHasher(resumeState);
@@ -42,6 +43,7 @@ export default {
         const sendComment = (text = "") => sendRaw(`: ${text}\n\n`);
         const sendSSE = (data) => sendRaw(`data: ${JSON.stringify(data)}\n\n`);
         (async () => {
+          let writers = [];
           try {
             sendComment("open");
             const upstream = await fetch(url, {
@@ -57,33 +59,80 @@ export default {
               return;
             }
             const reader = upstream.body.getReader();
-            if (upstream.status === 200 && cursor > 0) {
-              const leftover = await discardBytes(reader, cursor);
-              if (leftover) hasher.update(leftover);
-            }
-            const PROGRESS_INTERVAL = 1024 * 1024;
-            let lastSentCursor = cursor;
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (value && value.byteLength) {
-                hasher.update(value);
-                if (hasher.cursor - lastSentCursor >= PROGRESS_INTERVAL) {
-                  sendSSE({
-                    status: "processing",
-                    cursor: hasher.cursor,
-                    state: hasher.exportState(),
-                  });
-                  lastSentCursor = hasher.cursor;
+            const SIZE_LIMIT = 1024 * 1024 * 1024;
+            const contentLength = parseContentLength(upstream.headers.get("content-length"));
+            const useNative = !isIntermediate && upstream.status === 200 && contentLength !== null && contentLength <= SIZE_LIMIT;
+            if (useNative) {
+              const md5 = new crypto.DigestStream("MD5");
+              const sha1 = new crypto.DigestStream("SHA-1");
+              const sha256 = new crypto.DigestStream("SHA-256");
+              const md5w = md5.getWriter();
+              const sha1w = sha1.getWriter();
+              const sha256w = sha256.getWriter();
+              writers = [md5w, sha1w, sha256w];
+              const HEARTBEAT_INTERVAL = 10 * 1024 * 1024;
+              let processed = 0;
+              let lastBeat = 0;
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const len = value ? value.byteLength : 0;
+                if (!len) continue;
+                await Promise.all([md5w.write(value), sha1w.write(value), sha256w.write(value)]);
+                processed += len;
+                if (processed - lastBeat >= HEARTBEAT_INTERVAL) {
+                  sendComment("ping");
+                  lastBeat = processed;
                 }
               }
+              await Promise.all([md5w.close(), sha1w.close(), sha256w.close()]);
+              writers = [];
+              const [md5d, sha1d, sha256d] = await Promise.all([md5.digest, sha1.digest, sha256.digest]);
+              sendSSE({
+                status: "completed",
+                engine: "native",
+                cursor: processed,
+                hashes: {
+                  md5: toHex(md5d),
+                  sha1: toHex(sha1d),
+                  sha256: toHex(sha256d),
+                },
+              });
+            } else {
+              if (upstream.status === 200 && cursor > 0) {
+                const leftover = await discardBytes(reader, cursor);
+                if (leftover) hasher.update(leftover);
+              }
+              const PROGRESS_INTERVAL = 10 * 1024 * 1024;
+              let lastSentCursor = cursor;
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.byteLength) {
+                  hasher.update(value);
+                  if (hasher.cursor - lastSentCursor >= PROGRESS_INTERVAL) {
+                    sendSSE({
+                      status: "processing",
+                      cursor: hasher.cursor,
+                      state: hasher.exportState(),
+                    });
+                    lastSentCursor = hasher.cursor;
+                  }
+                }
+              }
+              sendSSE({
+                status: "completed",
+                engine: "js",
+                cursor: hasher.cursor,
+                hashes: hasher.digest(),
+              });
             }
-            sendSSE({
-              status: "completed",
-              cursor: hasher.cursor,
-              hashes: hasher.digest(),
-            });
           } catch (e) {
+            for (const w of writers) {
+              try {
+                await w.abort(e);
+              } catch {}
+            }
             try {
               sendSSE({ error: e?.message || String(e) });
             } catch {}
@@ -114,6 +163,20 @@ function jsonError(error, status = 400) {
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
 }
+function parseContentLength(headerValue) {
+  if (!headerValue) return null;
+  const n = Number(headerValue);
+  if (!Number.isSafeInteger(n) || n < 0) return null;
+  return n;
+}
+function toHex(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const hex = new Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    hex[i] = bytes[i].toString(16).padStart(2, "0");
+  }
+  return hex.join("");
+}
 async function discardBytes(reader, bytes) {
   let discarded = 0;
   while (discarded < bytes) {
@@ -133,11 +196,12 @@ async function discardBytes(reader, bytes) {
 }
 class MultiHasher {
   constructor(saved = null) {
-    const buffer = saved?.buffer ? Uint8Array.from(saved.buffer) : new Uint8Array(0);
-    if (buffer.byteLength >= 64) throw new Error("Invalid state: buffer must be shorter than 64 bytes");
+    const savedBuffer = saved?.buffer;
+    const savedLen = savedBuffer ? savedBuffer.length : 0;
+    if (savedLen >= 64) throw new Error("Invalid state: buffer must be shorter than 64 bytes");
     this.buffer = new Uint8Array(64);
-    this.bufferLen = buffer.byteLength;
-    this.buffer.set(buffer);
+    this.bufferLen = savedLen;
+    if (savedLen > 0) this.buffer.set(savedBuffer);
     this.sha1 = normalizeHashState(saved?.sha1, [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0], 5);
     this.sha256 = normalizeHashState(saved?.sha256, [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], 8);
     this.md5 = normalizeHashState(saved?.md5, [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476], 4);
@@ -231,14 +295,18 @@ function rotr(n, b) {
   return (n >>> b) | (n << (32 - b));
 }
 function writeLen64BE(view, offset, byteLen) {
-  const bits = BigInt(byteLen) * 8n;
-  view.setUint32(offset, Number((bits >> 32n) & 0xffffffffn), false);
-  view.setUint32(offset + 4, Number(bits & 0xffffffffn), false);
+  const bits = byteLen * 8;
+  const high = Math.floor(bits / 0x100000000);
+  const low = bits >>> 0;
+  view.setUint32(offset, high, false);
+  view.setUint32(offset + 4, low, false);
 }
 function writeLen64LE(view, offset, byteLen) {
-  const bits = BigInt(byteLen) * 8n;
-  view.setUint32(offset, Number(bits & 0xffffffffn), true);
-  view.setUint32(offset + 4, Number((bits >> 32n) & 0xffffffffn), true);
+  const bits = byteLen * 8;
+  const high = Math.floor(bits / 0x100000000);
+  const low = bits >>> 0;
+  view.setUint32(offset, low, true);
+  view.setUint32(offset + 4, high, true);
 }
 // SHA-1
 function processBlockSHA1(block, state) {
