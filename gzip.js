@@ -4,49 +4,40 @@ const MAX_URL_LEN = 4096;
 const MAX_TEXT_CHARS = 1 << 30;
 const HEARTBEAT_CHARS = 2 << 20;
 const MAX_GZIP_MEMBERS = 1 << 20;
-const GUNZIP_OUTPUT_CHUNK_SIZE = 64 * 1024;
+const EMPTY_U8 = new Uint8Array(0);
 const FAST_BITS = 16;
 const FAST_SIZE = 1 << FAST_BITS;
 const FAST_MASK = FAST_SIZE - 1;
-const EMPTY_U8 = new Uint8Array(0);
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
+const DECODE_BATCH_BYTES = 16 * 1024;
 const CL_ORDER = new Uint8Array([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
-const LEN_BASE = new Uint16Array([3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]);
 const LEN_EXTRA = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]);
-const DIST_BASE = new Uint16Array([1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]);
 const DIST_EXTRA = new Uint8Array([0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]);
 let FIXED_LITLEN_TREE = null;
 let FIXED_DIST_TREE = null;
+const DELIM_TABLE = (() => {
+  const t = new Uint8Array(128);
+  t[0x20] = 1;
+  t[0x09] = 1;
+  t[0x0a] = 1;
+  t[0x0d] = 1;
+  t[0x0c] = 1;
+  t[0x0b] = 1;
+  t[0x22] = 1;
+  t[0x27] = 1;
+  t[0x3c] = 1;
+  t[0x3e] = 1;
+  t[0x60] = 1;
+  t[0x7b] = 1;
+  t[0x7d] = 1;
+  t[0x7c] = 1;
+  t[0x5c] = 1;
+  t[0x5e] = 1;
+  t[0x5b] = 1;
+  t[0x5d] = 1;
+  return t;
+})();
 function isDelim(c) {
-  if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d || c === 0x0c || c === 0x0b) {
-    return true;
-  }
-  switch (c) {
-    case 0x22:
-    case 0x27:
-    case 0x3c:
-    case 0x3e:
-    case 0x60:
-    case 0x7b:
-    case 0x7d:
-    case 0x7c:
-    case 0x5c:
-    case 0x5e:
-    case 0x5b:
-    case 0x5d:
-      return true;
-  }
-  return false;
+  return c < 128 && DELIM_TABLE[c] === 1;
 }
 function joinStrings(parts) {
   if (parts.length === 0) return "";
@@ -114,23 +105,12 @@ function splitChunksAt(chunks, cut) {
   };
 }
 function cleanUrl(u) {
-  let end = u.length;
-  while (end > 0) {
-    const c = u.charCodeAt(end - 1);
-    if (c === 0x2e || c === 0x2c || c === 0x3b || c === 0x3a || c === 0x21 || c === 0x3f) {
-      end--;
-      continue;
-    }
-    break;
-  }
-  return end === u.length ? u : u.slice(0, end);
+  return u.replace(/[,.;:!?]+$/g, "");
 }
 function extractUrls(text) {
   const out = [];
   const seen = new Set();
-  URL_RE.lastIndex = 0;
-  let m;
-  while ((m = URL_RE.exec(text)) !== null) {
+  for (const m of text.matchAll(URL_RE)) {
     let u = m[0];
     if (u.length > MAX_URL_LEN) continue;
     u = cleanUrl(u);
@@ -153,9 +133,7 @@ function jsonError(message, status) {
 }
 function asUint8Array(chunk) {
   if (chunk instanceof Uint8Array) return chunk;
-  if (chunk instanceof ArrayBuffer) {
-    return new Uint8Array(chunk);
-  }
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
   if (ArrayBuffer.isView(chunk)) {
     return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   }
@@ -247,19 +225,16 @@ function buildHuffmanTree(lengths, name = "Huffman tree") {
     sym[node] = symbol;
   }
   return {
-    left: Int32Array.from(left),
-    right: Int32Array.from(right),
-    sym: Int32Array.from(sym),
+    left: new Int32Array(left),
+    right: new Int32Array(right),
+    sym: new Int32Array(sym),
     maxLen,
     fastTable,
   };
 }
 function getFixedTrees() {
   if (FIXED_LITLEN_TREE && FIXED_DIST_TREE) {
-    return {
-      litlen: FIXED_LITLEN_TREE,
-      dist: FIXED_DIST_TREE,
-    };
+    return { litlen: FIXED_LITLEN_TREE, dist: FIXED_DIST_TREE };
   }
   const litLens = new Uint8Array(288);
   for (let i = 0; i <= 143; i++) litLens[i] = 8;
@@ -270,26 +245,14 @@ function getFixedTrees() {
   distLens.fill(5);
   FIXED_LITLEN_TREE = buildHuffmanTree(litLens, "fixed literal/length Huffman tree");
   FIXED_DIST_TREE = buildHuffmanTree(distLens, "fixed distance Huffman tree");
-  return {
-    litlen: FIXED_LITLEN_TREE,
-    dist: FIXED_DIST_TREE,
-  };
+  return { litlen: FIXED_LITLEN_TREE, dist: FIXED_DIST_TREE };
 }
-class Inflate {
-  constructor(options = {}) {
-    this.options = options;
-    this.chunkSize = options.chunkSize || GUNZIP_OUTPUT_CHUNK_SIZE;
-    this.onData = null;
-    this.err = 0;
-    this.msg = "";
-    this.ended = false;
-    this.strm = {
-      input: EMPTY_U8,
-      next_in: 0,
-      avail_in: 0,
-      msg: "",
-    };
-    this.input = EMPTY_U8;
+class GzipMemberScanner {
+  constructor() {
+    this.buffer = EMPTY_U8;
+    this._resetParser();
+  }
+  _resetParser() {
     this.pos = 0;
     this.bitbuf = 0;
     this.bitlen = 0;
@@ -310,110 +273,108 @@ class Inflate {
     this.dynLengths = null;
     this.dynIndex = 0;
     this.dynPendingRepeat = null;
-    this.lengthBase = 0;
     this.lengthExtra = 0;
-    this.matchLength = 0;
-    this.distBase = 0;
     this.distExtra = 0;
-    this.matchDistance = 0;
     this.storedRemaining = 0;
-    this.output = new Uint8Array(this.chunkSize);
-    this.spareOutput = new Uint8Array(this.chunkSize);
-    this.outpos = 0;
-    this.window = new Uint8Array(32768);
-    this.wpos = 0;
-    this.crc = 0xffffffff;
-    this.totalOut = 0;
+    this.memberDone = false;
   }
-  push(chunk, final = false) {
-    try {
-      chunk = asUint8Array(chunk);
-      this._appendInput(chunk);
-      this._process(final);
-      this._updateStrm();
-      return true;
-    } catch (e) {
-      this.err = -3;
-      this.msg = e?.message || String(e);
-      this.strm.msg = this.msg;
-      this._updateStrm();
-      return false;
-    }
-  }
-  _appendInput(chunk) {
-    if (this.pos > 0) {
-      const bufferedBytes = this.bitlen >>> 3;
-      const keepPos = this.pos - bufferedBytes;
-      this.input = keepPos >= this.input.length ? EMPTY_U8 : this.input.subarray(keepPos);
-      this.pos = bufferedBytes;
-    }
-    if (!chunk || chunk.length === 0) return;
-    if (this.input.length === 0) {
-      this.input = chunk;
+  append(chunk) {
+    chunk = asUint8Array(chunk);
+    if (!chunk.length) return;
+    if (!this.buffer.length) {
+      this.buffer = chunk;
       return;
     }
-    const merged = new Uint8Array(this.input.length + chunk.length);
-    merged.set(this.input, 0);
-    merged.set(chunk, this.input.length);
-    this.input = merged;
+    const merged = new Uint8Array(this.buffer.length + chunk.length);
+    merged.set(this.buffer, 0);
+    merged.set(chunk, this.buffer.length);
+    this.buffer = merged;
   }
-  _updateStrm() {
-    const bufferedBytes = this.bitlen >>> 3;
-    const nextIn = this.pos >= bufferedBytes ? this.pos - bufferedBytes : 0;
-    this.strm.input = this.input;
-    this.strm.next_in = nextIn;
-    this.strm.avail_in = Math.max(0, this.input.length - nextIn);
-  }
-  _process() {
-    while (!this.ended) {
-      switch (this.state) {
-        case "GZIP_HEADER":
-          if (!this._parseGzipHeader()) return;
-          break;
-        case "BLOCK_HEADER":
-          if (!this._parseBlockHeader()) return;
-          break;
-        case "STORED_LEN":
-          if (!this._parseStoredLen()) return;
-          break;
-        case "STORED_COPY":
-          if (!this._parseStoredCopy()) return;
-          break;
-        case "DYNAMIC":
-          if (!this._parseDynamic()) return;
-          break;
-        case "HUFFMAN":
-          if (!this._parseHuffman()) return;
-          break;
-        case "LEN_EXTRA":
-          if (!this._parseLengthExtra()) return;
-          break;
-        case "DIST":
-          if (!this._parseDistance()) return;
-          break;
-        case "DIST_EXTRA":
-          if (!this._parseDistanceExtra()) return;
-          break;
-        case "COPY":
-          this._copyMatch();
-          break;
-        case "FOOTER":
-          if (!this._parseFooter()) return;
-          break;
-        case "DONE":
-          this.ended = true;
-          return;
-        default:
-          throw new Error(`Invalid inflate state: ${this.state}`);
+  stripLeadingZeroPadding() {
+    let i = 0;
+    const buf = this.buffer;
+    const len = buf.length;
+    if (len >= 4 && (buf.byteOffset & 3) === 0) {
+      const u32 = new Uint32Array(buf.buffer, buf.byteOffset, len >>> 2);
+      while (i + 4 <= len && u32[i >>> 2] === 0) {
+        i += 4;
+      }
+    } else {
+      while (i + 4 <= len && (buf[i] | buf[i + 1] | buf[i + 2] | buf[i + 3]) === 0) {
+        i += 4;
       }
     }
+    while (i < len && buf[i] === 0) i++;
+    if (i > 0) {
+      this.takePrefix(i);
+    }
+  }
+  committedBytes() {
+    const bufferedBytes = this.bitlen >>> 3;
+    return this.pos >= bufferedBytes ? this.pos - bufferedBytes : 0;
+  }
+  takePrefix(n) {
+    if (n <= 0) return EMPTY_U8;
+    const out = this.buffer.subarray(0, n);
+    this.buffer = n >= this.buffer.length ? EMPTY_U8 : this.buffer.subarray(n);
+    this.pos -= n;
+    if (this.pos < 0) this.pos = 0;
+    return out;
+  }
+  takeCommittedPrefix() {
+    return this.takePrefix(this.committedBytes());
+  }
+  beginNextMember() {
+    this._resetParser();
+  }
+  scan() {
+    while (!this.memberDone) {
+      switch (this.state) {
+        case "GZIP_HEADER":
+          if (!this._parseGzipHeader()) return false;
+          break;
+        case "BLOCK_HEADER":
+          if (!this._parseBlockHeader()) return false;
+          break;
+        case "STORED_LEN":
+          if (!this._parseStoredLen()) return false;
+          break;
+        case "STORED_SKIP":
+          if (!this._parseStoredSkip()) return false;
+          break;
+        case "DYNAMIC":
+          if (!this._parseDynamic()) return false;
+          break;
+        case "HUFFMAN":
+          if (!this._parseHuffman()) return false;
+          break;
+        case "LEN_EXTRA":
+          if (!this._parseLengthExtra()) return false;
+          break;
+        case "DIST":
+          if (!this._parseDistance()) return false;
+          break;
+        case "DIST_EXTRA":
+          if (!this._parseDistanceExtra()) return false;
+          break;
+        case "FOOTER":
+          if (!this._parseFooter()) return false;
+          break;
+        case "DONE":
+          this.memberDone = true;
+          return true;
+        default:
+          throw new Error(`Invalid gzip scanner state: ${this.state}`);
+      }
+    }
+    return true;
   }
   _readBits(n) {
     if (n === 0) return 0;
     let bitbuf = this.bitbuf;
     let bitlen = this.bitlen;
     let pos = this.pos;
-    const input = this.input;
+    const input = this.buffer;
     while (bitlen < n) {
       if (pos >= input.length) {
         this.pos = pos;
@@ -442,7 +403,7 @@ class Inflate {
     let bitbuf = this.bitbuf;
     let bitlen = this.bitlen;
     let pos = this.pos;
-    const input = this.input;
+    const input = this.buffer;
     const fastTable = tree.fastTable;
     while (bitlen < FAST_BITS && pos < input.length) {
       bitbuf |= input[pos++] << bitlen;
@@ -465,9 +426,7 @@ class Inflate {
     const maxLen = tree.maxLen;
     for (let depth = 0; depth < maxLen; depth++) {
       if (bitlen === 0) {
-        if (pos >= input.length) {
-          return null;
-        }
+        if (pos >= input.length) return null;
         bitbuf = input[pos++];
         bitlen = 8;
       }
@@ -495,11 +454,9 @@ class Inflate {
           if (this.bitlen !== 0) {
             throw new Error("Invalid gzip header alignment");
           }
-          if (this.pos + 10 > this.input.length) {
-            return false;
-          }
+          if (this.pos + 10 > this.buffer.length) return false;
           const p = this.pos;
-          const b = this.input;
+          const b = this.buffer;
           if (b[p] !== 0x1f || b[p + 1] !== 0x8b) {
             throw new Error("Invalid gzip header");
           }
@@ -517,10 +474,8 @@ class Inflate {
         }
         case 1: {
           if (this.gzFlags & 0x04) {
-            if (this.pos + 2 > this.input.length) {
-              return false;
-            }
-            this.gzExtraRemaining = this.input[this.pos] | (this.input[this.pos + 1] << 8);
+            if (this.pos + 2 > this.buffer.length) return false;
+            this.gzExtraRemaining = this.buffer[this.pos] | (this.buffer[this.pos + 1] << 8);
             this.pos += 2;
             this.gzStage = 2;
           } else {
@@ -530,27 +485,23 @@ class Inflate {
         }
         case 2: {
           if (this.gzExtraRemaining > 0) {
-            const n = Math.min(this.gzExtraRemaining, this.input.length - this.pos);
+            const n = Math.min(this.gzExtraRemaining, this.buffer.length - this.pos);
             this.pos += n;
             this.gzExtraRemaining -= n;
-            if (this.gzExtraRemaining > 0) {
-              return false;
-            }
+            if (this.gzExtraRemaining > 0) return false;
           }
           this.gzStage = 3;
           continue;
         }
         case 3: {
           if (this.gzFlags & 0x08) {
-            while (this.pos < this.input.length) {
-              if (this.input[this.pos++] === 0) {
+            while (this.pos < this.buffer.length) {
+              if (this.buffer[this.pos++] === 0) {
                 this.gzStage = 4;
                 break;
               }
             }
-            if (this.gzStage !== 4) {
-              return false;
-            }
+            if (this.gzStage !== 4) return false;
           } else {
             this.gzStage = 4;
           }
@@ -558,15 +509,13 @@ class Inflate {
         }
         case 4: {
           if (this.gzFlags & 0x10) {
-            while (this.pos < this.input.length) {
-              if (this.input[this.pos++] === 0) {
+            while (this.pos < this.buffer.length) {
+              if (this.buffer[this.pos++] === 0) {
                 this.gzStage = 5;
                 break;
               }
             }
-            if (this.gzStage !== 5) {
-              return false;
-            }
+            if (this.gzStage !== 5) return false;
           } else {
             this.gzStage = 5;
           }
@@ -574,14 +523,9 @@ class Inflate {
         }
         case 5: {
           if (this.gzFlags & 0x02) {
-            if (this.pos + 2 > this.input.length) {
-              return false;
-            }
+            if (this.pos + 2 > this.buffer.length) return false;
             this.pos += 2;
           }
-          this.crc = 0xffffffff;
-          this.totalOut = 0;
-          this.wpos = 0;
           this.gzStage = 0;
           this.state = "BLOCK_HEADER";
           return true;
@@ -593,9 +537,7 @@ class Inflate {
   }
   _parseBlockHeader() {
     const bits = this._readBits(3);
-    if (bits === null) {
-      return false;
-    }
+    if (bits === null) return false;
     this.lastBlock = (bits & 1) === 1;
     const type = bits >>> 1;
     if (type === 0) {
@@ -619,11 +561,9 @@ class Inflate {
   }
   _parseStoredLen() {
     this._alignToByte();
-    if (this.pos + 4 > this.input.length) {
-      return false;
-    }
-    const len = this.input[this.pos] | (this.input[this.pos + 1] << 8);
-    const nlen = this.input[this.pos + 2] | (this.input[this.pos + 3] << 8);
+    if (this.pos + 4 > this.buffer.length) return false;
+    const len = this.buffer[this.pos] | (this.buffer[this.pos + 1] << 8);
+    const nlen = this.buffer[this.pos + 2] | (this.buffer[this.pos + 3] << 8);
     this.pos += 4;
     if (((len ^ 0xffff) & 0xffff) !== nlen) {
       throw new Error("Invalid stored deflate block length");
@@ -632,26 +572,21 @@ class Inflate {
     if (this.storedRemaining === 0) {
       this._endBlock();
     } else {
-      this.state = "STORED_COPY";
+      this.state = "STORED_SKIP";
     }
     return true;
   }
-  _parseStoredCopy() {
+  _parseStoredSkip() {
     if (this.storedRemaining === 0) {
       this._endBlock();
       return true;
     }
-    const avail = this.input.length - this.pos;
-    if (avail <= 0) {
-      return false;
-    }
+    const avail = this.buffer.length - this.pos;
+    if (avail <= 0) return false;
     const n = Math.min(avail, this.storedRemaining);
-    this._emitBytes(this.input, this.pos, n);
     this.pos += n;
     this.storedRemaining -= n;
-    if (this.storedRemaining > 0) {
-      return false;
-    }
+    if (this.storedRemaining > 0) return false;
     this._endBlock();
     return true;
   }
@@ -672,27 +607,21 @@ class Inflate {
       switch (this.dynStage) {
         case 0: {
           const v = this._readBits(5);
-          if (v === null) {
-            return false;
-          }
+          if (v === null) return false;
           this.hlit = v + 257;
           this.dynStage = 1;
           continue;
         }
         case 1: {
           const v = this._readBits(5);
-          if (v === null) {
-            return false;
-          }
+          if (v === null) return false;
           this.hdist = v + 1;
           this.dynStage = 2;
           continue;
         }
         case 2: {
           const v = this._readBits(4);
-          if (v === null) {
-            return false;
-          }
+          if (v === null) return false;
           this.hclen = v + 4;
           this.dynCLens = new Uint8Array(19);
           this.dynCLIndex = 0;
@@ -702,9 +631,7 @@ class Inflate {
         case 3: {
           while (this.dynCLIndex < this.hclen) {
             const v = this._readBits(3);
-            if (v === null) {
-              return false;
-            }
+            if (v === null) return false;
             this.dynCLens[CL_ORDER[this.dynCLIndex++]] = v;
           }
           this.dynCodeLenTree = buildHuffmanTree(this.dynCLens, "code length Huffman tree");
@@ -719,9 +646,7 @@ class Inflate {
             if (this.dynPendingRepeat) {
               const repeat = this.dynPendingRepeat;
               const extra = this._readBits(repeat.extra);
-              if (extra === null) {
-                return false;
-              }
+              if (extra === null) return false;
               const count = repeat.base + extra;
               if (this.dynIndex + count > this.dynLengths.length) {
                 throw new Error("Invalid dynamic Huffman repeat");
@@ -732,17 +657,13 @@ class Inflate {
               continue;
             }
             const sym = this._decodeSymbol(this.dynCodeLenTree);
-            if (sym === null) {
-              return false;
-            }
+            if (sym === null) return false;
             if (sym < 16) {
               this.dynLengths[this.dynIndex++] = sym;
               continue;
             }
             if (sym === 16) {
-              if (this.dynIndex === 0) {
-                throw new Error("Invalid dynamic Huffman repeat");
-              }
+              if (this.dynIndex === 0) throw new Error("Invalid dynamic Huffman repeat");
               this.dynPendingRepeat = {
                 extra: 2,
                 base: 3,
@@ -751,19 +672,11 @@ class Inflate {
               continue;
             }
             if (sym === 17) {
-              this.dynPendingRepeat = {
-                extra: 3,
-                base: 3,
-                value: 0,
-              };
+              this.dynPendingRepeat = { extra: 3, base: 3, value: 0 };
               continue;
             }
             if (sym === 18) {
-              this.dynPendingRepeat = {
-                extra: 7,
-                base: 11,
-                value: 0,
-              };
+              this.dynPendingRepeat = { extra: 7, base: 11, value: 0 };
               continue;
             }
             throw new Error("Invalid code length symbol");
@@ -787,11 +700,8 @@ class Inflate {
   _parseHuffman() {
     for (;;) {
       const sym = this._decodeSymbol(this.litlenTree);
-      if (sym === null) {
-        return false;
-      }
+      if (sym === null) return false;
       if (sym < 256) {
-        this._emitByte(sym);
         continue;
       }
       if (sym === 256) {
@@ -801,13 +711,10 @@ class Inflate {
       if (sym > 285) {
         throw new Error("Invalid literal/length code");
       }
-      const idx = sym - 257;
-      this.lengthBase = LEN_BASE[idx];
-      this.lengthExtra = LEN_EXTRA[idx];
+      this.lengthExtra = LEN_EXTRA[sym - 257];
       if (this.lengthExtra) {
         this.state = "LEN_EXTRA";
       } else {
-        this.matchLength = this.lengthBase;
         this.state = "DIST";
       }
       return true;
@@ -815,97 +722,29 @@ class Inflate {
   }
   _parseLengthExtra() {
     const extra = this._readBits(this.lengthExtra);
-    if (extra === null) {
-      return false;
-    }
-    this.matchLength = this.lengthBase + extra;
+    if (extra === null) return false;
     this.state = "DIST";
     return true;
   }
   _parseDistance() {
     const sym = this._decodeSymbol(this.distTree);
-    if (sym === null) {
-      return false;
-    }
+    if (sym === null) return false;
     if (sym > 29) {
       throw new Error("Invalid distance code");
     }
-    this.distBase = DIST_BASE[sym];
     this.distExtra = DIST_EXTRA[sym];
     if (this.distExtra) {
       this.state = "DIST_EXTRA";
     } else {
-      this.matchDistance = this.distBase;
-      this.state = "COPY";
+      this.state = "HUFFMAN";
     }
     return true;
   }
   _parseDistanceExtra() {
     const extra = this._readBits(this.distExtra);
-    if (extra === null) {
-      return false;
-    }
-    this.matchDistance = this.distBase + extra;
-    this.state = "COPY";
-    return true;
-  }
-  _copyMatch() {
-    const distance = this.matchDistance;
-    if (distance <= 0 || distance > 32768 || distance > this.totalOut) {
-      throw new Error("Invalid deflate distance");
-    }
-    const len = this.matchLength;
-    if (distance >= len) {
-      let srcPos = this.wpos - distance;
-      if (srcPos < 0) srcPos += 32768;
-      if (srcPos + len <= 32768) {
-        this._emitBytes(this.window, srcPos, len);
-      } else {
-        const first = 32768 - srcPos;
-        this._emitBytes(this.window, srcPos, first);
-        this._emitBytes(this.window, 0, len - first);
-      }
-    } else {
-      const window = this.window;
-      const crcTable = CRC_TABLE;
-      let out = this.output;
-      let outpos = this.outpos;
-      let wpos = this.wpos;
-      let srcPos = (wpos - distance + 32768) & 32767;
-      let remaining = len;
-      let totalOut = this.totalOut;
-      let crc = this.crc;
-      while (remaining > 0) {
-        if (outpos === out.length) {
-          this.output = out;
-          this.outpos = outpos;
-          this.wpos = wpos;
-          this.totalOut = totalOut;
-          this.crc = crc;
-          this._flushOutput();
-          out = this.output;
-          outpos = this.outpos;
-        }
-        const b = window[srcPos];
-        srcPos = (srcPos + 1) & 32767;
-        window[wpos] = b;
-        wpos = (wpos + 1) & 32767;
-        out[outpos++] = b;
-        crc = (crcTable[(crc ^ b) & 255] ^ (crc >>> 8)) >>> 0;
-        totalOut++;
-        remaining--;
-      }
-      this.outpos = outpos;
-      this.wpos = wpos;
-      this.totalOut = totalOut;
-      this.crc = crc;
-      if (outpos === out.length) {
-        this._flushOutput();
-      }
-    }
-    this.matchLength = 0;
-    this.matchDistance = 0;
+    if (extra === null) return false;
     this.state = "HUFFMAN";
+    return true;
   }
   _endBlock() {
     if (this.lastBlock) {
@@ -916,196 +755,131 @@ class Inflate {
     }
   }
   _parseFooter() {
-    if (this.pos + 8 > this.input.length) {
-      return false;
-    }
-    const p = this.pos;
-    const b = this.input;
-    const storedCrc = (b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)) >>> 0;
-    const storedSize = (b[p + 4] | (b[p + 5] << 8) | (b[p + 6] << 16) | (b[p + 7] << 24)) >>> 0;
-    const actualCrc = (this.crc ^ 0xffffffff) >>> 0;
-    const actualSize = this.totalOut >>> 0;
-    if (storedCrc !== actualCrc) {
-      throw new Error("Gzip CRC check failed");
-    }
-    if (storedSize !== actualSize) {
-      throw new Error("Gzip size check failed");
-    }
+    if (this.pos + 8 > this.buffer.length) return false;
     this.pos += 8;
-    this._flushOutput();
     this.state = "DONE";
-    this.ended = true;
+    this.memberDone = true;
     return true;
   }
-  _emitByte(byte) {
-    byte &= 255;
-    const window = this.window;
-    const out = this.output;
-    const crcTable = CRC_TABLE;
-    window[this.wpos] = byte;
-    this.wpos = (this.wpos + 1) & 32767;
-    out[this.outpos++] = byte;
-    this.crc = (crcTable[(this.crc ^ byte) & 255] ^ (this.crc >>> 8)) >>> 0;
-    this.totalOut++;
-    if (this.outpos === out.length) {
-      this._flushOutput();
-    }
-  }
-  _emitBytes(src, start, len) {
-    if (len <= 0) return;
-    const window = this.window;
-    const crcTable = CRC_TABLE;
-    let out = this.output;
-    let outpos = this.outpos;
-    let wpos = this.wpos;
-    let totalOut = this.totalOut;
-    let crc = this.crc;
-    while (len > 0) {
-      if (outpos === out.length) {
-        this.output = out;
-        this.outpos = outpos;
-        this.wpos = wpos;
-        this.totalOut = totalOut;
-        this.crc = crc;
-        this._flushOutput();
-        out = this.output;
-        outpos = this.outpos;
+}
+function createMemberGunzipPump(controller) {
+  const compressed = new TransformStream();
+  const writer = compressed.writable.getWriter();
+  const reader = compressed.readable.pipeThrough(new DecompressionStream("gzip")).getReader();
+  const pump = (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          controller.enqueue(value);
+        }
       }
-      let n = len;
-      const outAvail = out.length - outpos;
-      if (n > outAvail) n = outAvail;
-      const winAvail = 32768 - wpos;
-      if (n > winAvail) n = winAvail;
-      const end = start + n;
-      const chunk = src.subarray(start, end);
-      for (let i = 0; i < n; i++) {
-        const byte = chunk[i];
-        crc = (crcTable[(crc ^ byte) & 255] ^ (crc >>> 8)) >>> 0;
-      }
-      out.set(chunk, outpos);
-      window.set(chunk, wpos);
-      outpos += n;
-      wpos += n;
-      if (wpos === 32768) wpos = 0;
-      totalOut += n;
-      start = end;
-      len -= n;
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {}
     }
-    this.outpos = outpos;
-    this.wpos = wpos;
-    this.totalOut = totalOut;
-    this.crc = crc;
-    if (outpos === out.length) {
-      this._flushOutput();
-    }
-  }
-  _flushOutput() {
-    if (!this.outpos) return;
-    const outBuf = this.output;
-    const out = this.outpos === outBuf.length ? outBuf : new Uint8Array(outBuf.buffer, outBuf.byteOffset, this.outpos);
-    this.output = this.spareOutput;
-    this.spareOutput = outBuf;
-    this.outpos = 0;
-    if (this.onData) {
-      this.onData(out);
-    }
-  }
+  })();
+  return { writer, pump };
 }
 function createMultiMemberGunzipStream(options = {}) {
-  const { maxMembers = MAX_GZIP_MEMBERS, chunkSize = GUNZIP_OUTPUT_CHUNK_SIZE, ignoreZeroPadding = true, onMemberStart, onMemberEnd } = options;
-  let inflator = null;
+  const { maxMembers = MAX_GZIP_MEMBERS, ignoreZeroPadding = true, onMemberStart, onMemberEnd } = options;
+  const scanner = new GzipMemberScanner();
+  let current = null;
   let memberNo = 0;
   let completedMembers = 0;
-  function makeInflateError(inf, prefix) {
-    const code = inf?.err;
-    const msg = inf?.msg || inf?.strm?.msg || "";
-    if (msg) return new Error(`${prefix}: ${msg}`);
-    if (code) return new Error(`${prefix}: inflate status ${code}`);
-    return new Error(prefix);
-  }
-  function stripZeroPadding(input) {
-    if (!ignoreZeroPadding) return input;
-    let i = 0;
-    const len = input.length;
-    while (i + 4 <= len && (input[i] | input[i + 1] | input[i + 2] | input[i + 3]) === 0) {
-      i += 4;
-    }
-    while (i < len && input[i] === 0) i++;
-    return i > 0 ? input.subarray(i) : input;
-  }
   function startMember(controller) {
     memberNo++;
     if (memberNo > maxMembers) {
       throw new Error(`Too many gzip members: more than ${maxMembers}`);
     }
-    if (onMemberStart) {
-      onMemberStart(memberNo);
-    }
-    const inf = new Inflate({
-      windowBits: 31,
-      chunkSize,
-    });
-    inf.onData = (data) => {
-      if (data && data.length) {
-        controller.enqueue(data);
-      }
-    };
-    return inf;
+    if (onMemberStart) onMemberStart(memberNo);
+    current = createMemberGunzipPump(controller);
   }
-  function getUnusedInput(inf) {
-    const s = inf?.strm;
-    if (!s || !s.input || !s.avail_in) {
-      return EMPTY_U8;
+  async function writeChunk(writer, chunk) {
+    if (chunk && chunk.length) {
+      await writer.write(chunk);
     }
-    return s.input.subarray(s.next_in, s.next_in + s.avail_in);
   }
-  function processInput(input, controller) {
-    input = asUint8Array(input);
-    while (input.length > 0) {
-      if (!inflator) {
-        input = stripZeroPadding(input);
-        if (input.length === 0) {
+  async function finishMember() {
+    const { writer, pump } = current;
+    current = null;
+    await writer.close();
+    await pump;
+    completedMembers++;
+    if (onMemberEnd) onMemberEnd(completedMembers, memberNo);
+    scanner.beginNextMember();
+  }
+  async function process(controller) {
+    for (;;) {
+      if (!current) {
+        if (ignoreZeroPadding) {
+          scanner.stripLeadingZeroPadding();
+        }
+        if (!scanner.buffer.length) {
           return;
         }
-        inflator = startMember(controller);
+        startMember(controller);
       }
-      const ok = inflator.push(input, false);
-      if (!ok) {
-        throw makeInflateError(inflator, `Invalid gzip member #${memberNo}`);
-      }
-      if (inflator.ended) {
-        const rest = getUnusedInput(inflator);
-        completedMembers++;
-        if (onMemberEnd) {
-          onMemberEnd(completedMembers, memberNo);
-        }
-        inflator = null;
-        input = rest;
+      scanner.scan();
+      const safe = scanner.takeCommittedPrefix();
+      await writeChunk(current.writer, safe);
+      if (scanner.memberDone) {
+        await finishMember();
         continue;
       }
       return;
     }
   }
   return new TransformStream({
-    transform(chunk, controller) {
-      processInput(chunk, controller);
+    async transform(chunk, controller) {
+      scanner.append(chunk);
+      try {
+        await process(controller);
+      } catch (e) {
+        if (current) {
+          try {
+            await current.writer.abort(e);
+          } catch {}
+        }
+        throw e;
+      }
     },
-    flush(controller) {
-      if (!inflator) return;
-      const ok = inflator.push(EMPTY_U8, true);
-      if (!ok) {
-        throw makeInflateError(inflator, `Invalid gzip member #${memberNo}`);
+    async flush(controller) {
+      try {
+        await process(controller);
+        if (current) {
+          throw new Error(`Unexpected EOF in gzip member #${memberNo}`);
+        }
+        if (ignoreZeroPadding) {
+          scanner.stripLeadingZeroPadding();
+        }
+        if (scanner.buffer.length) {
+          throw new Error("Trailing non-gzip data after last member");
+        }
+      } catch (e) {
+        if (current) {
+          try {
+            await current.writer.abort(e);
+          } catch {}
+        }
+        throw e;
       }
-      if (!inflator.ended) {
-        throw new Error(`Unexpected EOF in gzip member #${memberNo}`);
-      }
-      completedMembers++;
-      if (onMemberEnd) {
-        onMemberEnd(completedMembers, memberNo);
-      }
-      inflator = null;
     },
   });
+}
+function concatUint8Chunks(chunks, totalLen) {
+  if (totalLen === 0) return EMPTY_U8;
+  if (chunks.length === 1) return chunks[0];
+  const merged = new Uint8Array(totalLen);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
 }
 export default {
   async fetch(request) {
@@ -1154,6 +928,8 @@ export default {
           let textChars = 0;
           let lastBeat = 0;
           let aborted = false;
+          let pendingDecodeChunks = [];
+          let pendingDecodeBytes = 0;
           const gzipStats = {
             membersStarted: 0,
             membersCompleted: 0,
@@ -1188,6 +964,43 @@ export default {
             carryChunks = [];
             carryLen = 0;
             emitUrlsFromText(text);
+          }
+          function processDecodedText(text) {
+            if (!text) return;
+            textChars += text.length;
+            if (textChars > MAX_TEXT_CHARS) {
+              sendSSE({
+                type: "error",
+                error: "Decompressed text exceeds limit",
+                textChars,
+                gzipMembers: gzipStats.membersCompleted,
+              });
+              aborted = true;
+              return;
+            }
+            appendCarry(text);
+            const cut = findCutPoint(carryChunks, carryLen);
+            if (cut > 0) {
+              processCarryCut(cut);
+            }
+            if (textChars - lastBeat >= HEARTBEAT_CHARS) {
+              sendComment("ping");
+              lastBeat = textChars;
+            }
+          }
+          function queueDecodeChunk(value) {
+            pendingDecodeChunks.push(value);
+            pendingDecodeBytes += value.length;
+          }
+          function flushDecodedBytes(force = false) {
+            if (!decoder) return;
+            if (!force && pendingDecodeBytes < DECODE_BATCH_BYTES) return;
+            if (pendingDecodeBytes === 0) return;
+            const merged = concatUint8Chunks(pendingDecodeChunks, pendingDecodeBytes);
+            pendingDecodeChunks = [];
+            pendingDecodeBytes = 0;
+            const text = decoder.decode(merged, { stream: true });
+            processDecodedText(text);
           }
           try {
             sendComment("open");
@@ -1227,7 +1040,7 @@ export default {
               url: target,
               contentType: upstream.headers.get("content-type") || null,
               contentEncoding: upstream.headers.get("content-encoding") || null,
-              gunzip: "js-multi-member",
+              gunzip: "js-split-native-decompressionstream-multi-member",
             });
             const decompressed = upstream.body.pipeThrough(
               createMultiMemberGunzipStream({
@@ -1245,49 +1058,38 @@ export default {
               const { done, value } = await reader.read();
               if (done) break;
               if (!value || !value.length) continue;
-              const text = decoder.decode(value, { stream: true });
-              if (!text) continue;
-              textChars += text.length;
-              if (textChars > MAX_TEXT_CHARS) {
-                sendSSE({
-                  type: "error",
-                  error: "Decompressed text exceeds limit",
-                  textChars,
-                  gzipMembers: gzipStats.membersCompleted,
-                });
-                aborted = true;
+              queueDecodeChunk(value);
+              flushDecodedBytes(false);
+              if (aborted) {
                 break;
-              }
-              appendCarry(text);
-              const cut = findCutPoint(carryChunks, carryLen);
-              if (cut > 0) {
-                processCarryCut(cut);
-              }
-              if (textChars - lastBeat >= HEARTBEAT_CHARS) {
-                sendComment("ping");
-                lastBeat = textChars;
               }
             }
             if (!aborted) {
-              const tail = decoder.decode();
-              if (tail) {
-                appendCarry(tail);
+              flushDecodedBytes(true);
+              if (!aborted) {
+                const tail = decoder.decode();
+                if (tail) {
+                  processDecodedText(tail);
+                }
               }
-              emitCarry();
-              sendSSE({
-                type: "done",
-                status: "completed",
-                totalUrls,
-                textChars,
-                gzipMembers: gzipStats.membersCompleted,
-              });
+              if (!aborted) {
+                emitCarry();
+                sendSSE({
+                  type: "done",
+                  status: "completed",
+                  totalUrls,
+                  textChars,
+                  gzipMembers: gzipStats.membersCompleted,
+                });
+              }
             }
           } catch (e) {
             try {
               if (decoder) {
                 try {
+                  flushDecodedBytes(true);
                   const tail = decoder.decode();
-                  if (tail) appendCarry(tail);
+                  if (tail) processDecodedText(tail);
                   emitCarry();
                 } catch {}
               }
